@@ -21,7 +21,8 @@
 
 int log_fd = -1;
 int max_fds = 1;
-char svr_ip[32] = "192.168.1.229";
+char svr_ip[32] = "192.168.1.178";
+int port = 11800;
 
 boost::lockfree::spsc_queue<int, 
         boost::lockfree::capacity<1024> , 
@@ -67,7 +68,6 @@ int get_socket()
 {
     int connect_fd;
     int ret;
-    const int port = 11700;
 
     static struct sockaddr_in srv_addr;
     connect_fd = socket(PF_INET, SOCK_STREAM, 0);
@@ -247,6 +247,12 @@ int main(int argc, char *argv[]) {
         strncpy(svr_ip, argv[2], sizeof(svr_ip) - 1);
     }
     std::cout << "svr_ip: " << svr_ip << std::endl;
+
+    if(argc > 3)
+    {
+        port = std::stoi(argv[3]);
+    }
+    std::cout << "port: " << port << std::endl;
 
     read_handler();
     for(int i = 0; i < PRINT_BUFF_COUNT; i++)
