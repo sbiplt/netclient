@@ -22,14 +22,7 @@
 int log_fd = -1;
 int max_fds = 1;
 char svr_ip[32] = "192.168.1.229";
-
-boost::lockfree::spsc_queue<int, 
-        boost::lockfree::capacity<1024> , 
-        boost::lockfree::fixed_sized<true> > read_queue;
-
-boost::lockfree::spsc_queue<int, 
-        boost::lockfree::capacity<1024> , 
-        boost::lockfree::fixed_sized<true> > del_queue;
+int port = 11700;
 
 boost::lockfree::spsc_queue<char*, 
         boost::lockfree::capacity<PRINT_BUFF_COUNT> , 
@@ -67,7 +60,6 @@ int get_socket()
 {
     int connect_fd;
     int ret;
-    const int port = 11700;
 
     static struct sockaddr_in srv_addr;
     connect_fd = socket(PF_INET, SOCK_STREAM, 0);
@@ -103,6 +95,11 @@ int get_socket()
 
 void print_handler()
 {
+    for(int i = 0; i < PRINT_BUFF_COUNT; i++)
+    {
+        print_buff.push(new char[BUF_SIZE]);
+    }
+
     boost::thread th(
     []{
         char *buf;
@@ -118,119 +115,139 @@ void print_handler()
             boost::this_thread::sleep(boost::posix_time::milliseconds(5));
         }
     });
-    th.detach();
+    th.join();
 }
 
-void read_handler()
-{
-    boost::thread th(
-    []{
-        int fd;
-        char buf[BUF_SIZE + 1];
-        while(true){
-            while(read_queue.pop(fd))
-            {
-                int len = 0;
-                if(fd != log_fd)
-                {
-                    do
-                    {
-                        len = read(fd, buf, BUF_SIZE);
-                    }while(len > 0);
-                }
-                else
-                {
-                    char *pbuff;
-                    if(!print_buff.pop(pbuff))
-                    {
-                        pbuff = buf;
-                        std::cout << "print buffer exhaust " << std::endl;
-                    }
-                    len = read(fd, pbuff, BUF_SIZE);
+class event_handler {
+public:
+    event_handler(){}
+    ~event_handler()
+    {
 
-                    while( len > 0 )
+    }
+    
+    void read_handler()
+    {
+        boost::thread th(
+        [&]{
+            int fd;
+            char buf[BUF_SIZE + 1];
+            while(true){
+                while(read_queue.pop(fd))
+                {
+                    int len = 0;
+                    if(fd != log_fd)
                     {
-                        if(pbuff != buf)
+                        do
                         {
-                            pbuff[len] = '\0'; 
-                            print_data.push(pbuff);
-                        }
-
+                            len = read(fd, buf, BUF_SIZE);
+                        }while(len > 0);
+                    }
+                    else
+                    {
+                        char *pbuff;
                         if(!print_buff.pop(pbuff))
                         {
                             pbuff = buf;
                             std::cout << "print buffer exhaust " << std::endl;
                         }
                         len = read(fd, pbuff, BUF_SIZE);
+
+                        while( len > 0 )
+                        {
+                            if(pbuff != buf)
+                            {
+                                pbuff[len] = '\0'; 
+                                print_data.push(pbuff);
+                            }
+
+                            if(!print_buff.pop(pbuff))
+                            {
+                                pbuff = buf;
+                                std::cout << "print buffer exhaust " << std::endl;
+                            }
+                            len = read(fd, pbuff, BUF_SIZE);
+                        }
+
+                        if(pbuff != buf)
+                        {
+                            pbuff[len] = '\0'; 
+                            print_data.push(pbuff);
+                        }
                     }
 
-                    if(pbuff != buf)
-                    {
-                        pbuff[len] = '\0'; 
-                        print_data.push(pbuff);
+                    if (len == 0) {
+                        std::cout << "recv zero data, close:" << fd << std::endl;
+                        del_queue.push(fd);
                     }
+                    else if (len == -1 && errno != EAGAIN) {
+                        std::cout << "errno: " << errno << "  close fd:" << fd << std::endl;
+                        del_queue.push(fd);
+                    } 
                 }
-
-                if (len == 0) {
-                    std::cout << "recv zero data, close:" << fd << std::endl;
-                    del_queue.push(fd);
-                }
-                else if (len == -1 && errno != EAGAIN) {
-                    std::cout << "errno: " << errno << "  close fd:" << fd << std::endl;
-                    del_queue.push(fd);
-                } 
+                boost::this_thread::sleep(boost::posix_time::milliseconds(5));
             }
-            boost::this_thread::sleep(boost::posix_time::milliseconds(5));
-        }
-    });
-    th.detach();
-}
+        });
+        th.detach();
+    }
 
-void epoll_loop(int max_fds)
-{
-    int ep_fd = epoll_create(max_fds);
-
-    struct epoll_event ev, evs[max_fds];
-    for(int i = 0; i < max_fds; i++)
+    void epoll_loop(int max_fds)
     {
-        int fd = get_socket();
-        if(fd > 0)
-        {
-            ev.data.fd = fd;
-            ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
-            epoll_ctl(ep_fd, EPOLL_CTL_ADD, fd, &ev);
-        }
-    }
+        boost::thread th([&]{
+            int ep_fd = epoll_create(max_fds);
 
-    int ev_fd;
-    while (true) {
-        int nfds = epoll_wait(ep_fd, evs, max_fds, -1);
-        for (int i = 0; i < nfds; i++) {
-            if (evs[i].events & EPOLLIN) {
-                if ((ev_fd = evs[i].data.fd) > 0) {
-                    printf("epollin event fd:%d\n", ev_fd);
-                    read_queue.push(ev_fd);
-                }
-            } else if(evs[i].events & EPOLLOUT){
-                if ((ev_fd = evs[i].data.fd) > 0) {
-                    printf("receive epoll out fd:%d\n", ev_fd);
-                    char out_data[] = "{(len=29)MARKET01@@S@+@@@&NASD,AAPL.US}";
-                    write(ev_fd, out_data, sizeof(out_data) - 1);
-
-                    ev.events = EPOLLIN | EPOLLET;
-                    epoll_ctl(ep_fd, EPOLL_CTL_ADD, ev_fd, &ev);
+            struct epoll_event ev, evs[max_fds];
+            for(int i = 0; i < max_fds; i++)
+            {
+                int fd = get_socket();
+                if(fd > 0)
+                {
+                    ev.data.fd = fd;
+                    ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+                    epoll_ctl(ep_fd, EPOLL_CTL_ADD, fd, &ev);
                 }
             }
-        }
 
-        int del_fd;
-        while(del_queue.pop(del_fd))
-        {
-            epoll_ctl(ep_fd, EPOLL_CTL_DEL, del_fd, &ev);
-            close(del_fd);
-        }
+            int ev_fd;
+            while (true) {
+                int nfds = epoll_wait(ep_fd, evs, max_fds, -1);
+                for (int i = 0; i < nfds; i++) {
+                    if (evs[i].events & EPOLLIN) {
+                        if ((ev_fd = evs[i].data.fd) > 0) {
+                            printf("epollin event fd:%d\n", ev_fd);
+                            read_queue.push(ev_fd);
+                        }
+                    } else if(evs[i].events & EPOLLOUT){
+                        if ((ev_fd = evs[i].data.fd) > 0) {
+                            printf("receive epoll out fd:%d\n", ev_fd);
+                            char out_data[] = "{(len=29)MARKET01@@S@+@@@&NASD,AAPL.US}";
+                            write(ev_fd, out_data, sizeof(out_data) - 1);
+
+                            ev.events = EPOLLIN | EPOLLET;
+                            epoll_ctl(ep_fd, EPOLL_CTL_ADD, ev_fd, &ev);
+                        }
+                    }
+                }
+
+                int del_fd;
+                while(del_queue.pop(del_fd))
+                {
+                    epoll_ctl(ep_fd, EPOLL_CTL_DEL, del_fd, &ev);
+                    close(del_fd);
+                }
+            }
+        });
     }
-}
+
+private:
+    boost::lockfree::spsc_queue<int, 
+            boost::lockfree::capacity<1024> , 
+            boost::lockfree::fixed_sized<true> > read_queue;
+
+    boost::lockfree::spsc_queue<int, 
+            boost::lockfree::capacity<1024> , 
+            boost::lockfree::fixed_sized<true> > del_queue;
+};
 
 int main(int argc, char *argv[]) {
     signal(SIGPIPE, SIG_IGN);
@@ -248,14 +265,33 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "svr_ip: " << svr_ip << std::endl;
 
-    read_handler();
-    for(int i = 0; i < PRINT_BUFF_COUNT; i++)
+    if(argc > 3)
     {
-        print_buff.push(new char[BUF_SIZE]);
+        port = std::stoi(argv[3]);
+    }
+    std::cout << "port: " << port << std::endl;
+
+    int cnt = max_fds/500 + (max_fds%500 > 0 ? 1 : 0);
+    event_handler vec[cnt];
+
+    int need_connect = max_fds;
+    for(auto &eh : vec)
+    {
+        if(need_connect > 500)
+        {
+            eh.epoll_loop(500);
+            eh.read_handler();
+            need_connect -= 500;
+        }
+        else if(need_connect > 0)
+        {
+            eh.epoll_loop(need_connect);
+            eh.read_handler();
+            need_connect = 0;
+        }
     }
     print_handler();
-    epoll_loop(max_fds); 
-    
+
     return 0;
 }
 
