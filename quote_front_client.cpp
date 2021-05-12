@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <errno.h>
 #include <sys/types.h>
@@ -21,7 +22,8 @@
 
 int log_fd = -1;
 int max_fds = 1;
-char svr_ip[32] = "192.168.1.229";
+char svr_ip[32] = "192.168.1.178";
+int port = 11800;
 
 boost::lockfree::spsc_queue<int, 
         boost::lockfree::capacity<1024> , 
@@ -94,6 +96,10 @@ int get_socket()
     {
         return -1;
     }
+
+    int yes = 1;
+    setsockopt(connect_fd,IPPROTO_TCP,TCP_NODELAY,(void*)&yes,sizeof(int));
+    setsockopt(connect_fd, IPPROTO_TCP, TCP_QUICKACK, (void *)&yes, sizeof(int)); 
 
     if(log_fd == -1){
         log_fd = connect_fd;
@@ -247,6 +253,12 @@ int main(int argc, char *argv[]) {
         strncpy(svr_ip, argv[2], sizeof(svr_ip) - 1);
     }
     std::cout << "svr_ip: " << svr_ip << std::endl;
+
+    if(argc > 3)
+    {
+        port = std::stoi(argv[3]);
+    }
+    std::cout << "port: " << port << std::endl;
 
     read_handler();
     for(int i = 0; i < PRINT_BUFF_COUNT; i++)
