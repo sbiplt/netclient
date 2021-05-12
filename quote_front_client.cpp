@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/epoll.h>
 #include <errno.h>
 #include <sys/types.h>
@@ -16,6 +17,7 @@
 
 #define PRINT_BUFF_COUNT 100 
 #define BUF_SIZE 8000
+#define CONNECT_PER_LOOP 200
 
 #define printf(...) 
 
@@ -74,17 +76,35 @@ int get_socket()
     srv_addr.sin_addr.s_addr = inet_addr(svr_ip);
     srv_addr.sin_port = htons(port);
 
-    ret = connect(connect_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
-    if(ret == -1)
+    int try_count = 5;
+    do
     {
-        perror("cannot connect to the server");
-        close(connect_fd);
-        return -1;
-    }
+        ret = connect(connect_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
+        if(ret == -1 && try_count-- > 0)
+        {
+            boost::this_thread::sleep_for(boost::chrono::milliseconds(10));
+        }
+        else if(ret < 0)
+        {
+            perror("cannot connect to the server");
+            close(connect_fd);
+            return -1;
+        }
+    }while(ret < 0);
 
     if (setnonblocking(connect_fd) < 0)
     {
         return -1;
+    }
+
+    int yes = 1;
+    if(setsockopt(connect_fd, IPPROTO_TCP, TCP_NODELAY, (void*)&yes,sizeof(int)) < 0)
+    {
+        std::cout << "set delay error" << std::endl;
+    }
+    if(setsockopt(connect_fd, IPPROTO_TCP, TCP_QUICKACK, (void *)&yes, sizeof(int)) < 0)
+    {
+        std::cout << "set quick ack error" << std::endl;
     }
 
     if(log_fd == -1){
@@ -271,17 +291,17 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "port: " << port << std::endl;
 
-    int cnt = max_fds/500 + (max_fds%500 > 0 ? 1 : 0);
+    int cnt = max_fds/CONNECT_PER_LOOP + (max_fds%CONNECT_PER_LOOP > 0 ? 1 : 0);
     event_handler vec[cnt];
 
     int need_connect = max_fds;
     for(auto &eh : vec)
     {
-        if(need_connect > 500)
+        if(need_connect > CONNECT_PER_LOOP)
         {
-            eh.epoll_loop(500);
+            eh.epoll_loop(CONNECT_PER_LOOP);
             eh.read_handler();
-            need_connect -= 500;
+            need_connect -= CONNECT_PER_LOOP;
         }
         else if(need_connect > 0)
         {
