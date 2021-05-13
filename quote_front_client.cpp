@@ -1,26 +1,23 @@
 #include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/epoll.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/socket.h>
 #include <signal.h>
 #include <memory.h>
 #include <boost/lockfree/spsc_queue.hpp>
 #include <boost/thread.hpp>
+#include <boost/chrono.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
+#include <boost/enable_shared_from_this.hpp>
+#include <boost/shared_ptr.hpp>
+#include <asio.hpp>
+#include <asio/io_service.hpp>
+#include <set>
 
 #define PRINT_BUFF_COUNT 100 
 #define BUF_SIZE 8000
+#define CONNECT_PER_LOOP 200
 
-#define printf(...) 
+unsigned int max_fds = 1;
 
 int log_fd = -1;
-int max_fds = 1;
 char svr_ip[32] = "192.168.1.229";
 int port = 11700;
 
@@ -32,225 +29,203 @@ boost::lockfree::spsc_queue<char*,
         boost::lockfree::capacity<PRINT_BUFF_COUNT> , 
         boost::lockfree::fixed_sized<true> > print_data;
 
-
-bool setnonblocking(int socket_fd) {
-    int opt;
-
-    opt = fcntl(socket_fd, F_GETFL);
-    if (opt < 0) {
-        printf("fcntl(F_GETFL) fail.");
-        return -1;
-    }
-    opt |= O_NONBLOCK;
-    if (fcntl(socket_fd, F_SETFL, opt) < 0) {
-        printf("fcntl(F_SETFL) fail.");
-        return -1;
-    }
-    return 0;
-}
-
 void handle_sig(int signum)
 {
     printf("receiv sig int");
-    sleep(5);
     exit(0);
 }
-
-int get_socket()
-{
-    int connect_fd;
-    int ret;
-
-    static struct sockaddr_in srv_addr;
-    connect_fd = socket(PF_INET, SOCK_STREAM, 0);
-    if(connect_fd < 0)
-    {
-        perror("cannot create communication socket");
-        return -1;
-    }
-
-    memset(&srv_addr, 0, sizeof(srv_addr));
-    srv_addr.sin_family = AF_INET;
-    srv_addr.sin_addr.s_addr = inet_addr(svr_ip);
-    srv_addr.sin_port = htons(port);
-
-    ret = connect(connect_fd, (struct sockaddr *)&srv_addr, sizeof(srv_addr));
-    if(ret == -1)
-    {
-        perror("cannot connect to the server");
-        close(connect_fd);
-        return -1;
-    }
-
-    if (setnonblocking(connect_fd) < 0)
-    {
-        return -1;
-    }
-
-    if(log_fd == -1){
-        log_fd = connect_fd;
-    }
-    return connect_fd;
-}
+class event_handler;
 
 void print_handler()
 {
-    for(int i = 0; i < PRINT_BUFF_COUNT; i++)
-    {
-        print_buff.push(new char[BUF_SIZE]);
-    }
+	for (int i = 0; i < PRINT_BUFF_COUNT; i++)
+	{
+		print_buff.push(new char[BUF_SIZE]);
+	}
 
-    boost::thread th(
-    []{
-        char *buf;
-        while(true){
-            while(print_data.pop(buf))
-            {
-                if(*buf)
-                {
-                    std::cout << "recv: " << buf << std::endl;;
-                }
-                print_buff.push(buf);
-            }
-            boost::this_thread::sleep(boost::posix_time::milliseconds(5));
-        }
-    });
-    th.join();
+	boost::thread th(
+		[] {
+		char *buf;
+		while (true) {
+			while (print_data.pop(buf))
+			{
+				if (*buf)
+				{
+					std::cout << "recv: " << buf << std::endl;;
+				}
+				print_buff.push(buf);
+			}
+			boost::this_thread::sleep(boost::posix_time::milliseconds(5));
+		}
+	});
+	th.join();
 }
 
-class event_handler {
+class tcp_channel : public boost::enable_shared_from_this<tcp_channel>
+{
 public:
-    event_handler(){}
-    ~event_handler()
-    {
+	tcp_channel(asio::io_service &io_):socket_(io_),ep(asio::ip::address::from_string(svr_ip), port)
+	{
+	}
+	~tcp_channel()
+	{
+		socket_.close();
+		std::cout << "channel release ..." << std::endl;
+	}
 
-    }
-    
-    void read_handler()
-    {
-        boost::thread th(
-        [&]{
-            int fd;
-            char buf[BUF_SIZE + 1];
-            while(true){
-                while(read_queue.pop(fd))
-                {
-                    int len = 0;
-                    if(fd != log_fd)
-                    {
-                        do
-                        {
-                            len = read(fd, buf, BUF_SIZE);
-                        }while(len > 0);
-                    }
-                    else
-                    {
-                        char *pbuff;
-                        if(!print_buff.pop(pbuff))
-                        {
-                            pbuff = buf;
-                            std::cout << "print buffer exhaust " << std::endl;
-                        }
-                        len = read(fd, pbuff, BUF_SIZE);
+	void start(std::function<void()> f, bool need_print = false)
+	{
+		this->need_print = need_print;
+		exit_ = f;
+		do_connect();
+	}
 
-                        while( len > 0 )
-                        {
-                            if(pbuff != buf)
-                            {
-                                pbuff[len] = '\0'; 
-                                print_data.push(pbuff);
-                            }
-
-                            if(!print_buff.pop(pbuff))
-                            {
-                                pbuff = buf;
-                                std::cout << "print buffer exhaust " << std::endl;
-                            }
-                            len = read(fd, pbuff, BUF_SIZE);
-                        }
-
-                        if(pbuff != buf)
-                        {
-                            pbuff[len] = '\0'; 
-                            print_data.push(pbuff);
-                        }
-                    }
-
-                    if (len == 0) {
-                        std::cout << "recv zero data, close:" << fd << std::endl;
-                        del_queue.push(fd);
-                    }
-                    else if (len == -1 && errno != EAGAIN) {
-                        std::cout << "errno: " << errno << "  close fd:" << fd << std::endl;
-                        del_queue.push(fd);
-                    } 
-                }
-                boost::this_thread::sleep(boost::posix_time::milliseconds(5));
-            }
-        });
-        th.detach();
-    }
-
-    void epoll_loop(int max_fds)
-    {
-        boost::thread th([&]{
-            int ep_fd = epoll_create(max_fds);
-
-            struct epoll_event ev, evs[max_fds];
-            for(int i = 0; i < max_fds; i++)
-            {
-                int fd = get_socket();
-                if(fd > 0)
-                {
-                    ev.data.fd = fd;
-                    ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
-                    epoll_ctl(ep_fd, EPOLL_CTL_ADD, fd, &ev);
-                }
-            }
-
-            int ev_fd;
-            while (true) {
-                int nfds = epoll_wait(ep_fd, evs, max_fds, -1);
-                for (int i = 0; i < nfds; i++) {
-                    if (evs[i].events & EPOLLIN) {
-                        if ((ev_fd = evs[i].data.fd) > 0) {
-                            printf("epollin event fd:%d\n", ev_fd);
-                            read_queue.push(ev_fd);
-                        }
-                    } else if(evs[i].events & EPOLLOUT){
-                        if ((ev_fd = evs[i].data.fd) > 0) {
-                            printf("receive epoll out fd:%d\n", ev_fd);
-                            char out_data[] = "{(len=29)MARKET01@@S@+@@@&NASD,AAPL.US}";
-                            write(ev_fd, out_data, sizeof(out_data) - 1);
-
-                            ev.events = EPOLLIN | EPOLLET;
-                            epoll_ctl(ep_fd, EPOLL_CTL_ADD, ev_fd, &ev);
-                        }
-                    }
-                }
-
-                int del_fd;
-                while(del_queue.pop(del_fd))
-                {
-                    epoll_ctl(ep_fd, EPOLL_CTL_DEL, del_fd, &ev);
-                    close(del_fd);
-                }
-            }
-        });
-    }
-
+	void do_connect()
+	{
+		auto self(shared_from_this());
+		socket_.async_connect(ep,
+			[self](std::error_code ec)
+		{
+			if (!ec)
+			{
+				self->do_write();
+			}
+			else
+			{
+				printf("do_accept failure: Errcode=%d,ErrMsg=%s\n", ec.value(), ec.message().c_str());
+				self->exit_();
+			}
+		});
+	}
+		
 private:
-    boost::lockfree::spsc_queue<int, 
-            boost::lockfree::capacity<1024> , 
-            boost::lockfree::fixed_sized<true> > read_queue;
+	void do_write()
+	{
+		auto self(shared_from_this());
+		asio::async_write(socket_,
+			asio::buffer(sub_msg.c_str(), sub_msg.length()),
+			[self](std::error_code ec, std::size_t length)
+		{
+			if (!ec)
+			{
+				if(!self->need_print)
+				{
+					self->do_read();
+				}
+				else
+				{
+					self->do_read_print();
+				}
+			}
+			else
+			{
+				printf("do_write Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", self->socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
+				self->exit_();
+			}
+		});
+	}
+	
+	void do_read()
+	{
+		auto self(shared_from_this());
+		socket_.async_read_some(asio::buffer(buf, BUF_SIZE),
+			[self](std::error_code ec, std::size_t bytes)
+		{
+			if (!ec)
+			{
+				self->do_read();
+			}
+			else
+			{
+				printf("do_read Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", self->socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
+				self->exit_();
+			}
+		});
+	}
 
-    boost::lockfree::spsc_queue<int, 
-            boost::lockfree::capacity<1024> , 
-            boost::lockfree::fixed_sized<true> > del_queue;
+	void do_read_print()
+	{
+		char *buff;
+	    bool is_print = print_buff.pop(buff);
+		if (is_print)
+		{
+			buff = buf;
+			std::cout << "print buff exhaust " << std::endl;
+		}
+		auto self(shared_from_this());
+		socket_.async_read_some(asio::buffer(buff, BUF_SIZE),
+			[self, buff, is_print](std::error_code ec, std::size_t bytes)
+		{
+			if (!ec)
+			{
+				if (is_print)
+				{
+					print_data.push(buff);
+				}
+				self->do_read_print();
+			}
+			else
+			{
+				printf("do_read Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", self->socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
+				self->exit_();
+			}
+		});
+	}
+
+	char buf[BUF_SIZE + 1];
+	asio::ip::tcp::socket socket_;
+	boost::function<void()> exit_;
+	asio::ip::tcp::endpoint ep;
+	bool need_print;
+
+	std::string sub_msg{ "{(len=29)MARKET01@@S@+@@@&NASD,AAPL.US}" };
+	std::string unsub_msg{ "{(len=29)MARKET01@@S@-@@@&NASD,AAPL.US}" };
+};
+
+class event_handler 
+{
+public:
+	event_handler() 
+	{ 
+		boost::thread th1([this]
+		{
+			asio::io_context::work worker(context);  
+			context.run();
+		});
+		th1.detach();
+
+		boost::thread th2([this] {
+			while (true)
+			{
+				if (channel_set.size() < max_fds)
+				{
+					auto ptr = boost::make_shared<tcp_channel>(context);
+					channel_set.insert(ptr);
+					ptr->start([this, ptr] {
+						channel_set.erase(ptr); 
+					});
+				}
+				else
+				{
+					boost::this_thread::sleep_for(boost::chrono::seconds(1));
+				}
+			}
+		});
+		th2.detach();
+	}
+
+	~event_handler() 
+	{ 
+		context.stop();
+	}
+    
+private:
+
+	asio::io_service context;
+	std::set<boost::shared_ptr<void>> channel_set;
 };
 
 int main(int argc, char *argv[]) {
-    signal(SIGPIPE, SIG_IGN);
     signal(SIGINT, handle_sig);
     
     if(argc > 1)
@@ -271,25 +246,8 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "port: " << port << std::endl;
 
-    int cnt = max_fds/500 + (max_fds%500 > 0 ? 1 : 0);
-    event_handler vec[cnt];
+	event_handler eh;
 
-    int need_connect = max_fds;
-    for(auto &eh : vec)
-    {
-        if(need_connect > 500)
-        {
-            eh.epoll_loop(500);
-            eh.read_handler();
-            need_connect -= 500;
-        }
-        else if(need_connect > 0)
-        {
-            eh.epoll_loop(need_connect);
-            eh.read_handler();
-            need_connect = 0;
-        }
-    }
     print_handler();
 
     return 0;

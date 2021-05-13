@@ -1,7 +1,7 @@
 TARGET = quote_front_client
 CXX = g++ 
 CXXFLAGS = -std=c++11 -Wall -Os 
-LIBS = -lboost_thread -lboost_system
+LIBS = -lboost_thread -lboost_system -lpthread
 
 $(TARGET): quote_front_client.o
 	$(CXX) $(CXXFLAGS) $(LIBS) $^ -o $@
