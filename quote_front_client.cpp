@@ -11,11 +11,11 @@
 #include <asio/io_service.hpp>
 #include <set>
 
-#define PRINT_BUFF_COUNT 100 
+#define PRINT_BUFF_COUNT 10000
 #define BUF_SIZE 8000
 #define CONNECT_PER_LOOP 200
 
-unsigned int max_fds = 1;
+unsigned int max_fds = 2000;
 
 int log_fd = -1;
 char svr_ip[32] = "192.168.1.229";
@@ -47,7 +47,8 @@ void print_handler()
 		[] {
 		char *buf;
 		while (true) {
-			while (print_data.pop(buf))
+		
+			if (print_data.pop(buf))
 			{
 				if (*buf)
 				{
@@ -55,7 +56,6 @@ void print_handler()
 				}
 				print_buff.push(buf);
 			}
-			boost::this_thread::sleep(boost::posix_time::milliseconds(5));
 		}
 	});
 	th.join();
@@ -64,8 +64,9 @@ void print_handler()
 class tcp_channel : public boost::enable_shared_from_this<tcp_channel>
 {
 public:
-	tcp_channel(asio::io_service &io_):socket_(io_),ep(asio::ip::address::from_string(svr_ip), port)
+	tcp_channel(asio::io_service &io_):socket_(io_),ep(asio::ip::address::from_string(svr_ip), port),timer(io_, std::chrono::seconds(10))
 	{
+		timer.async_wait(std::bind(&tcp_channel::send_beat, this, std::placeholders::_1));
 	}
 	~tcp_channel()
 	{
@@ -84,61 +85,80 @@ public:
 	{
 		auto self(shared_from_this());
 		socket_.async_connect(ep,
-			[self](std::error_code ec)
+			[this, self](std::error_code ec)
 		{
 			if (!ec)
 			{
-				self->do_write();
+				do_write(sub_msg);
+
+				if(!need_print)
+				{
+					do_read();
+				}
+				else
+				{
+					do_read_print();
+				}
 			}
 			else
 			{
 				printf("do_accept failure: Errcode=%d,ErrMsg=%s\n", ec.value(), ec.message().c_str());
-				self->exit_();
+				release();
 			}
 		});
 	}
-		
-private:
-	void do_write()
+
+    void send_beat(std::error_code ec)
+    {
+		if (!ec) 
+		{
+			do_write(heartbeat_msg);
+			timer.expires_at(timer.expiry() + asio::chrono::seconds(10));
+			auto self(shared_from_this());
+			timer.async_wait(std::bind(&tcp_channel::send_beat, self, std::placeholders::_1));
+		}
+		else
+		{
+			printf("time error: Errcode=%d,ErrMsg=%s\n", ec.value(), ec.message().c_str());
+			release();
+		}
+    }		
+
+	void do_write(const std::string& msg)
 	{
 		auto self(shared_from_this());
 		asio::async_write(socket_,
-			asio::buffer(sub_msg.c_str(), sub_msg.length()),
-			[self](std::error_code ec, std::size_t length)
+			asio::buffer(msg.c_str(), msg.length()),
+			[this, self](std::error_code ec, std::size_t length)
 		{
-			if (!ec)
+			if (ec)
 			{
-				if(!self->need_print)
-				{
-					self->do_read();
-				}
-				else
-				{
-					self->do_read_print();
-				}
-			}
-			else
-			{
-				printf("do_write Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", self->socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
-				self->exit_();
+				printf("do_write Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
+				release();
 			}
 		});
 	}
-	
+
+    void release()
+    {
+        timer.cancel();
+        exit_();
+    }
+
 	void do_read()
 	{
 		auto self(shared_from_this());
 		socket_.async_read_some(asio::buffer(buf, BUF_SIZE),
-			[self](std::error_code ec, std::size_t bytes)
+			[this, self](std::error_code ec, std::size_t bytes)
 		{
 			if (!ec)
 			{
-				self->do_read();
+				do_read();
 			}
 			else
 			{
-				printf("do_read Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", self->socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
-				self->exit_();
+				printf("do_read Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
+				release();
 			}
 		});
 	}
@@ -150,11 +170,11 @@ private:
 		if (is_print)
 		{
 			buff = buf;
-			std::cout << "print buff exhaust " << std::endl;
+			std::cout << "print buff exhaust " << print_data.write_available() << std::endl;
 		}
 		auto self(shared_from_this());
 		socket_.async_read_some(asio::buffer(buff, BUF_SIZE),
-			[self, buff, is_print](std::error_code ec, std::size_t bytes)
+			[this, self, buff, is_print](std::error_code ec, std::size_t bytes)
 		{
 			if (!ec)
 			{
@@ -162,12 +182,12 @@ private:
 				{
 					print_data.push(buff);
 				}
-				self->do_read_print();
+				do_read_print();
 			}
 			else
 			{
-				printf("do_read Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", self->socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
-				self->exit_();
+				printf("do_read Disconnect:PeerPort=%d,Errcode=%d,ErrMsg=%s\n", socket_.remote_endpoint().port(), ec.value(), ec.message().c_str());
+				release();
 			}
 		});
 	}
@@ -178,8 +198,10 @@ private:
 	asio::ip::tcp::endpoint ep;
 	bool need_print;
 
+    asio::steady_timer timer; 
 	std::string sub_msg{ "{(len=29)MARKET01@@S@+@@@&NASD,AAPL.US}" };
 	std::string unsub_msg{ "{(len=29)MARKET01@@S@-@@@&NASD,AAPL.US}" };
+	std::string heartbeat_msg{ "{(len=19)TEST0001@@@@@@@@@@&}" };
 };
 
 class event_handler 
@@ -201,9 +223,17 @@ public:
 				{
 					auto ptr = boost::make_shared<tcp_channel>(context);
 					channel_set.insert(ptr);
+					bool is_print = log_socket == nullptr;
 					ptr->start([this, ptr] {
+						if (log_socket == ptr) {
+							log_socket = nullptr;
+						}
 						channel_set.erase(ptr); 
-					});
+					}, is_print);
+					if (is_print)
+					{
+						log_socket = ptr;
+					}
 				}
 				else
 				{
@@ -220,8 +250,8 @@ public:
 	}
     
 private:
-
 	asio::io_service context;
+	boost::shared_ptr<void> log_socket;
 	std::set<boost::shared_ptr<void>> channel_set;
 };
 
