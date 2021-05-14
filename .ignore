@@ -1,2 +1,7 @@
 quote_front_client.o
 quote_front_client
+.vs/
+Debug/
+QuoteFrontClient.vcxproj.user
+Release/
+
